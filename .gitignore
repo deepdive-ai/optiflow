@@ -13,5 +13,8 @@ venv/
 # Runtime-generated data (not source)
 voice_notes.json
 
+# Local test assets (not part of the app)
+dummy_test_eye_photo.jpg
+
 # OS
 .DS_Store

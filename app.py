@@ -1,7 +1,9 @@
+from __future__ import annotations
+
+import base64
 import json
 import os
 import tempfile
-import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -18,7 +20,7 @@ st.set_page_config(page_title="OptiFlow", layout="wide")
 VOICE_NOTES_FILE = Path("voice_notes.json")
 
 # Cheap to swap (e.g. to a Sonnet/Haiku model) without touching the call site below.
-ANTHROPIC_MODEL = "claude-opus-5"
+ANTHROPIC_MODEL = "claude-haiku-4-5"
 
 CLINICAL_SUMMARY_SYSTEM_PROMPT = """You are an AI clinical assistant supporting an optometrist. You are not an autonomous clinician and you do not provide diagnoses.
 
@@ -28,11 +30,13 @@ Given structured examination data for one patient visit, write a concise clinica
 - Highlight areas the optometrist may want to review
 - Note where further evaluation may be appropriate
 - Reference the assessment category and referral status already recorded in the data
+- If data from a previous visit is provided, note which values have changed and by how much, using cautious language (e.g. "IOP has increased since the last visit, which may warrant closer monitoring")
 
 You must NOT:
 - State or imply a definitive diagnosis (e.g. never say "the patient has glaucoma")
 - Claim that you diagnosed anything
 - Present your output as medical advice
+- Claim that a change between visits confirms disease progression — describe it as a change worth reviewing, not a confirmed trend
 
 When flagging a finding, use cautious language such as "potential finding to review," "consider further evaluation," "potential referral consideration," or "this finding may warrant additional assessment."
 
@@ -41,32 +45,95 @@ If no previous visit is available for comparison, state that plainly rather than
 Keep the summary concise (roughly 100-200 words), scannable, and useful to a busy optometrist."""
 
 
-def build_patient_summary_prompt(patient: pd.Series) -> str:
-    referral_specialty = patient["Referral_Specialty"] if pd.notna(patient["Referral_Specialty"]) else "N/A"
+def _format_visit_block(visit: pd.Series, heading: str | None = None) -> str:
+    lines = [f"{heading}\n"] if heading else []
+    lines += [
+        f"Visit Date: {visit['Visit_Date'].date()}\n",
+        f"Visual Acuity OD/OS: {visit['Visual_Acuity_OD']} / {visit['Visual_Acuity_OS']}\n",
+        f"IOP OD/OS (mmHg): {visit['IOP_OD_mmHg']} / {visit['IOP_OS_mmHg']}\n",
+        f"Spherical Equivalent OD/OS (D): {visit['Spherical_Equivalent_OD_D']} / {visit['Spherical_Equivalent_OS_D']}\n",
+        f"C/D Ratio OD/OS: {visit['CD_Ratio_OD']} / {visit['CD_Ratio_OS']}\n",
+        f"Assessment Category: {visit['Assessment_Category']}\n",
+    ]
+    return "".join(lines)
+
+
+def build_patient_summary_prompt(current: pd.Series, previous: pd.Series | None) -> str:
+    referral_specialty = current["Referral_Specialty"] if pd.notna(current["Referral_Specialty"]) else "N/A"
+    current_block = (
+        f"Patient ID: {current['Patient_ID']}\n"
+        f"Age: {current['Age']}\n"
+        f"Gender: {current['Gender']}\n"
+        + _format_visit_block(current)
+        + f"Referral Required: {current['Referral_Required']}\n"
+        f"Referral Specialty: {referral_specialty}\n"
+    )
+
+    if previous is None:
+        return (
+            current_block
+            + "\nPrevious visits on file: None — this is the only recorded visit for this patient "
+            "in the current dataset."
+        )
+
+    previous_block = _format_visit_block(previous, heading="Previous Visit")
     return (
-        f"Patient ID: {patient['Patient_ID']}\n"
-        f"Age: {patient['Age']}\n"
-        f"Gender: {patient['Gender']}\n"
-        f"Visit Date: {patient['Visit_Date'].date()}\n"
-        f"Visual Acuity OD/OS: {patient['Visual_Acuity_OD']} / {patient['Visual_Acuity_OS']}\n"
-        f"IOP OD/OS (mmHg): {patient['IOP_OD_mmHg']} / {patient['IOP_OS_mmHg']}\n"
-        f"Spherical Equivalent OD/OS (D): {patient['Spherical_Equivalent_OD_D']} / {patient['Spherical_Equivalent_OS_D']}\n"
-        f"C/D Ratio OD/OS: {patient['CD_Ratio_OD']} / {patient['CD_Ratio_OS']}\n"
-        f"Assessment Category: {patient['Assessment_Category']}\n"
-        f"Referral Required: {patient['Referral_Required']}\n"
-        f"Referral Specialty: {referral_specialty}\n\n"
-        "Previous visits on file: None — this is the only recorded visit for this patient "
-        "in the current dataset."
+        current_block
+        + "\n"
+        + previous_block
+        + "\nA previous visit is available above for comparison — note any notable changes "
+        "between the previous and current visit per your instructions."
     )
 
 
-def generate_ai_summary(patient: pd.Series) -> str:
+def generate_ai_summary(current: pd.Series, previous: pd.Series | None) -> str:
     client = anthropic.Anthropic()
     response = client.messages.create(
         model=ANTHROPIC_MODEL,
         max_tokens=1024,
         system=CLINICAL_SUMMARY_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": build_patient_summary_prompt(patient)}],
+        messages=[{"role": "user", "content": build_patient_summary_prompt(current, previous)}],
+    )
+    return next(block.text for block in response.content if block.type == "text")
+
+
+CASE_SUMMARY_SYSTEM_PROMPT = """You are an AI clinical assistant supporting an optometrist. You are not an autonomous clinician and you do not provide diagnoses.
+
+The optometrist has uploaded a prior report or eye photo for a patient they are seeing. Write a concise summary of what is visible or stated in the uploaded material, to help the optometrist review it quickly. You may:
+- Describe key details you can identify (reported findings, measurements, visible image characteristics)
+- Note anything that looks unclear, illegible, or outside typical ranges, using cautious language such as "potential finding to review" or "may warrant closer inspection"
+- Suggest what the optometrist may want to look at more closely in the original file
+
+You must NOT:
+- State or imply a definitive diagnosis
+- Claim you diagnosed anything from the image or report
+- Present your output as medical advice
+
+If the uploaded content is illegible, not a clinical document or eye photo, or otherwise unclear, say so plainly rather than guessing.
+
+Keep the summary concise (roughly 100-200 words)."""
+
+
+def build_case_content_blocks(files) -> list[dict]:
+    blocks = []
+    for file in files:
+        data = base64.standard_b64encode(file.getvalue()).decode("utf-8")
+        block_type = "document" if file.type == "application/pdf" else "image"
+        blocks.append({"type": block_type, "source": {"type": "base64", "media_type": file.type, "data": data}})
+    blocks.append({
+        "type": "text",
+        "text": "Summarize the uploaded prior report/photo(s) above for the optometrist reviewing this patient.",
+    })
+    return blocks
+
+
+def generate_case_summary(files) -> str:
+    client = anthropic.Anthropic()
+    response = client.messages.create(
+        model=ANTHROPIC_MODEL,
+        max_tokens=1024,
+        system=CASE_SUMMARY_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": build_case_content_blocks(files)}],
     )
     return next(block.text for block in response.content if block.type == "text")
 
@@ -255,6 +322,113 @@ def patient_examinations_page() -> None:
     )
 
 
+VA_SCALE = ["6/6", "6/9", "6/12", "6/18", "6/24"]
+
+
+def va_line_diff(before: str, after: str) -> int:
+    """Positive = worse (moved down the Snellen scale), negative = improved."""
+    return VA_SCALE.index(after) - VA_SCALE.index(before)
+
+
+def patient_history_page() -> None:
+    examinations = load_examinations()
+    st.title("Patient History")
+    st.caption(
+        "Compare a patient's examinations across visits. Only patients with more "
+        "than one recorded visit have a history to show — most patients in this "
+        "synthetic dataset still have just one."
+    )
+
+    patient_id = st.selectbox(
+        "Patient", sorted(examinations["Patient_ID"].unique()), key="history_patient"
+    )
+    patient_visits = examinations[examinations["Patient_ID"] == patient_id].sort_values("Visit_Date")
+
+    if len(patient_visits) < 2:
+        st.info(f"Only one recorded visit on file for {patient_id} — no history to compare yet.")
+        st.dataframe(
+            patient_visits,
+            width="stretch",
+            column_config={"Visit_Date": st.column_config.DateColumn("Visit_Date", format="YYYY-MM-DD")},
+        )
+        return
+
+    st.caption(f"{len(patient_visits)} visits on file for {patient_id}.")
+
+    visit1, visit2 = patient_visits.iloc[-2], patient_visits.iloc[-1]
+
+    visit_cols = st.columns(2)
+    for col, visit, label in zip(visit_cols, (visit1, visit2), ("Earlier Visit", "Most Recent Visit")):
+        with col, st.container(border=True):
+            st.subheader(f"{label} — {visit['Visit_Date'].date()}")
+            metric_cols = st.columns(2)
+            metric_cols[0].metric("Visual Acuity OD/OS", f"{visit['Visual_Acuity_OD']} / {visit['Visual_Acuity_OS']}")
+            metric_cols[1].metric("IOP OD/OS", f"{visit['IOP_OD_mmHg']} / {visit['IOP_OS_mmHg']}")
+            metric_cols = st.columns(2)
+            metric_cols[0].metric("C/D Ratio OD/OS", f"{visit['CD_Ratio_OD']} / {visit['CD_Ratio_OS']}")
+            metric_cols[1].metric("Assessment", visit["Assessment_Category"])
+
+    st.subheader("Change Since Earlier Visit")
+    st.caption("Red/upward deltas flag values where an increase is the finding worth reviewing (IOP, C/D ratio, worse visual acuity). Spherical equivalent shift has no inherent 'better' direction, so it's shown without color.")
+
+    change_row1 = st.columns(3)
+    change_row1[0].metric(
+        "IOP OD (mmHg)", visit2["IOP_OD_mmHg"],
+        delta=round(float(visit2["IOP_OD_mmHg"] - visit1["IOP_OD_mmHg"]), 2), delta_color="inverse",
+    )
+    change_row1[1].metric(
+        "IOP OS (mmHg)", visit2["IOP_OS_mmHg"],
+        delta=round(float(visit2["IOP_OS_mmHg"] - visit1["IOP_OS_mmHg"]), 2), delta_color="inverse",
+    )
+    change_row1[2].metric(
+        "Visual Acuity OD", visit2["Visual_Acuity_OD"],
+        delta=va_line_diff(visit1["Visual_Acuity_OD"], visit2["Visual_Acuity_OD"]), delta_color="inverse",
+    )
+
+    change_row2 = st.columns(3)
+    change_row2[0].metric(
+        "C/D Ratio OD", visit2["CD_Ratio_OD"],
+        delta=round(float(visit2["CD_Ratio_OD"] - visit1["CD_Ratio_OD"]), 2), delta_color="inverse",
+    )
+    change_row2[1].metric(
+        "C/D Ratio OS", visit2["CD_Ratio_OS"],
+        delta=round(float(visit2["CD_Ratio_OS"] - visit1["CD_Ratio_OS"]), 2), delta_color="inverse",
+    )
+    change_row2[2].metric(
+        "Visual Acuity OS", visit2["Visual_Acuity_OS"],
+        delta=va_line_diff(visit1["Visual_Acuity_OS"], visit2["Visual_Acuity_OS"]), delta_color="inverse",
+    )
+
+    change_row3 = st.columns(2)
+    change_row3[0].metric(
+        "Spherical Equivalent OD (D)", visit2["Spherical_Equivalent_OD_D"],
+        delta=round(float(visit2["Spherical_Equivalent_OD_D"] - visit1["Spherical_Equivalent_OD_D"]), 2),
+        delta_color="off",
+    )
+    change_row3[1].metric(
+        "Spherical Equivalent OS (D)", visit2["Spherical_Equivalent_OS_D"],
+        delta=round(float(visit2["Spherical_Equivalent_OS_D"] - visit1["Spherical_Equivalent_OS_D"]), 2),
+        delta_color="off",
+    )
+
+    st.subheader("IOP Trend")
+    iop_trend = px.line(
+        patient_visits,
+        x="Visit_Date",
+        y=["IOP_OD_mmHg", "IOP_OS_mmHg"],
+        markers=True,
+        labels={"value": "IOP (mmHg)", "Visit_Date": "Visit Date", "variable": "Eye"},
+    )
+    st.plotly_chart(iop_trend, use_container_width=True)
+
+    with st.expander("All recorded visits"):
+        st.dataframe(
+            patient_visits,
+            width="stretch",
+            column_config={"Visit_Date": st.column_config.DateColumn("Visit_Date", format="YYYY-MM-DD")},
+        )
+
+
 def referrals_page() -> None:
     ophthalmologists = load_ophthalmologists()
     st.title("Ophthalmology Referral Directory")
@@ -277,7 +451,15 @@ def ai_summary_page() -> None:
     patient_id = st.selectbox(
         "Patient", sorted(examinations["Patient_ID"].unique()), key="ai_summary_patient"
     )
-    patient = examinations[examinations["Patient_ID"] == patient_id].iloc[0]
+    patient_visits = examinations[examinations["Patient_ID"] == patient_id].sort_values("Visit_Date")
+    patient = patient_visits.iloc[-1]
+    previous_visit = patient_visits.iloc[-2] if len(patient_visits) > 1 else None
+
+    st.caption(
+        f"{len(patient_visits)} visit(s) on file for {patient_id}."
+        + (f" Comparing against the previous visit on {previous_visit['Visit_Date'].date()}."
+           if previous_visit is not None else "")
+    )
 
     with st.container(border=True):
         st.subheader(f"Current Examination — {patient_id}")
@@ -290,7 +472,7 @@ def ai_summary_page() -> None:
     if st.button("Generate AI Clinical Summary"):
         with st.spinner("Generating summary..."):
             try:
-                st.session_state["ai_summary_text"] = generate_ai_summary(patient)
+                st.session_state["ai_summary_text"] = generate_ai_summary(patient, previous_visit)
                 st.session_state["ai_summary_patient_id"] = patient_id
             except Exception as exc:
                 st.error(f"Could not generate summary: {exc}")
@@ -304,15 +486,21 @@ def ai_summary_page() -> None:
 
 
 def submit_case_page() -> None:
-    st.title("Submit a Case for Second Opinion")
-    st.warning(
-        "**Concept demo only — not a real upload.** Do not upload real patient photos "
-        "or medical reports. Nothing on this page is stored, encrypted, or sent to any "
-        "AI service; it exists to preview the intended UX flow only."
-    )
+    st.title("Upload Prior Report")
     st.caption(
-        "Previews how a patient might submit prior reports or eye photos for a second "
-        "opinion. Use placeholder/dummy files only — e.g. a random test image or PDF."
+        "For the optometrist: upload a patient's prior report or eye photo to get an "
+        "AI-assisted summary before the exam. Synthetic/demo data only."
+    )
+
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        st.warning("ANTHROPIC_API_KEY is not set in the environment. Set it before generating a summary.")
+        return
+
+    st.warning(
+        "**Do not upload real patient photos or medical reports.** Uploaded file "
+        "content is sent to Anthropic's API to generate the summary below — use "
+        "placeholder/dummy files only, e.g. a random test image or PDF. Nothing is "
+        "persisted to disk by this app."
     )
 
     uploaded_files = st.file_uploader(
@@ -329,27 +517,21 @@ def submit_case_page() -> None:
             else:
                 st.info(f"📄 {file.name} ({file.size / 1024:.1f} KB)")
 
-    consent = st.checkbox(
-        "I consent to this case, including any uploaded files, being reviewed by a "
-        "licensed ophthalmologist, and understand any AI assistance is for "
-        "summarization only and subject to the reviewing doctor's judgment. "
-        "(Placeholder consent text for this demo — not a real agreement.)"
+    acknowledged = st.checkbox(
+        "I confirm these are placeholder/dummy files only — not real patient data — "
+        "and understand they will be sent to Anthropic's API for summarization."
     )
 
-    if st.button("Submit Case", disabled=not (uploaded_files and consent)):
-        st.session_state["demo_case_id"] = f"DEMO-{uuid.uuid4().hex[:8].upper()}"
+    if st.button("Generate AI Summary", disabled=not (uploaded_files and acknowledged)):
+        with st.spinner("Generating summary..."):
+            try:
+                st.session_state["case_summary_text"] = generate_case_summary(uploaded_files)
+            except Exception as exc:
+                st.error(f"Could not generate summary: {exc}")
 
-    if st.session_state.get("demo_case_id"):
-        st.success(
-            f"Case submitted. Reference ID: {st.session_state['demo_case_id']} "
-            "— demo only, not real, nothing stored."
-        )
-        st.subheader("AI Summary")
-        st.info(
-            "🔒 An AI-generated summary would appear here once connected to a real "
-            "summarization service. Not implemented in this demo — no file content "
-            "has been sent anywhere."
-        )
+    if st.session_state.get("case_summary_text"):
+        st.info("**AI-generated summary — optometrist review required.**")
+        st.write(st.session_state["case_summary_text"])
 
 
 def voice_notes_page() -> None:
@@ -408,9 +590,10 @@ pages = st.navigation(
                 icon="📋",
                 url_path="patient-examinations",
             ),
+            st.Page(patient_history_page, title="Patient History", icon="📈", url_path="patient-history"),
             st.Page(referrals_page, title="Ophthalmology Referrals", icon="🏥", url_path="referrals"),
             st.Page(ai_summary_page, title="AI Clinical Summary", icon="🤖", url_path="ai-summary"),
-            st.Page(submit_case_page, title="Submit a Case", icon="📤", url_path="submit-case"),
+            st.Page(submit_case_page, title="Upload Prior Report", icon="📤", url_path="submit-case"),
             st.Page(voice_notes_page, title="Dictate Note", icon="🎙️", url_path="voice-notes"),
         ]
     }

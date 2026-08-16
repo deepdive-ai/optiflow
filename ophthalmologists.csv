@@ -1,0 +1,11 @@
+Doctor_ID,Doctor_Name,Specialty,Clinic_Name,Area,City,Phone,Email,Referral_Category,Verification_Status
+O001,Dr. Anirudh Rao,General Ophthalmology,City Vision Hospital,Madhapur,Hyderabad,+91 90000 10001,referral1@example.com,General Ophthalmology,Synthetic / Demo Data
+O002,Dr. Priyanka Menon,Cornea,ClearSight Eye Hospital,Secunderabad,Hyderabad,+91 90000 10002,referral2@example.com,Cornea,Synthetic / Demo Data
+O003,Dr. Sandeep Reddy,Retina,Netradeep Specialty Clinic,Kukatpally,Hyderabad,+91 90000 10003,referral3@example.com,Retina,Synthetic / Demo Data
+O004,Dr. Kavitha Iyer,Retina,City Vision Hospital,Begumpet,Hyderabad,+91 90000 10004,referral4@example.com,Retina,Synthetic / Demo Data
+O005,Dr. Arjun Mehta,Glaucoma,ClearSight Eye Hospital,Begumpet,Hyderabad,+91 90000 10005,referral5@example.com,Glaucoma,Synthetic / Demo Data
+O006,Dr. Neelima Sharma,Glaucoma,VisionCare Eye Centre,Secunderabad,Hyderabad,+91 90000 10006,referral6@example.com,Glaucoma,Synthetic / Demo Data
+O007,Dr. Vivek Nair,General Ophthalmology,Netradeep Specialty Clinic,Begumpet,Hyderabad,+91 90000 10007,referral7@example.com,General Ophthalmology,Synthetic / Demo Data
+O008,Dr. Ritu Kapoor,Retina,City Vision Hospital,Secunderabad,Hyderabad,+91 90000 10008,referral8@example.com,Retina,Synthetic / Demo Data
+O009,Dr. Sameer Patel,Cornea,VisionCare Eye Centre,Secunderabad,Hyderabad,+91 90000 10009,referral9@example.com,Cornea,Synthetic / Demo Data
+O010,Dr. Lakshmi Varma,General Ophthalmology,Hyderabad Eye Institute,Begumpet,Hyderabad,+91 90000 10010,referral10@example.com,Cataract,Synthetic / Demo Data

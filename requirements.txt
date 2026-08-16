@@ -1,0 +1,6 @@
+streamlit
+pandas
+plotly
+faster-whisper
+anthropic
+python-dotenv
